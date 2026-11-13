@@ -34,6 +34,19 @@ func parseReuseModules(t *testing.T, files map[string]string) map[string]*Module
 	return mods
 }
 
+func parseSourceModules(t *testing.T, files map[string]string) map[string]*Module {
+	t.Helper()
+	mods := make(map[string]*Module, len(files))
+	for name, src := range files {
+		m, err := ParseModuleWithOpts(name, src, ParserOptions{RegoVersion: RegoV1, ProcessAnnotation: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		mods[name] = m
+	}
+	return mods
+}
+
 func compileReusing(t *testing.T, prev *Compiler, mods map[string]*Module) *Compiler {
 	t.Helper()
 	c := NewCompiler().WithRuleReuse(prev)
@@ -197,6 +210,117 @@ func TestCompilerRuleReuse(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCompilerRuleReuseSourceModules(t *testing.T) {
+	r1 := labeledRule("r1", "1", `input.x == "a"`)
+	r2 := labeledRule("r2", "1", `input.x == "b"`)
+	r3 := labeledRule("r3", "1", `input.x == "c"`)
+
+	prev := compileReusing(t, nil, parseSourceModules(t, map[string]string{
+		"main.rego": reuseMain,
+		"a.rego":    pkg(r1, r2),
+	}))
+	next := compileReusing(t, prev, parseSourceModules(t, map[string]string{
+		"main.rego": reuseMain,
+		"a.rego":    pkg(r1, r2, r3),
+	}))
+
+	if s := next.RuleReuseStats(); !s.Incremental || s.Reused != 3 {
+		t.Fatalf("stats %+v", s)
+	}
+
+	full := NewCompiler()
+	if full.Compile(parseSourceModules(t, map[string]string{
+		"main.rego": reuseMain,
+		"a.rego":    pkg(r1, r2, r3),
+	})); full.Failed() {
+		t.Fatal(full.Errors)
+	}
+	for name, m := range full.Modules {
+		if got, exp := next.Modules[name].String(), m.String(); got != exp {
+			t.Errorf("%s: got\n%s\nwant\n%s", name, got, exp)
+		}
+	}
+}
+
+func TestCompilerRuleReuseChangedSourceRule(t *testing.T) {
+	r1 := labeledRule("r1", "1", `input.x == "a"`)
+	r2 := labeledRule("r2", "1", `input.x == "b"`)
+	r2v2 := labeledRule("r2", "2", `input.x == "c"`)
+
+	prev := compileReusing(t, nil, parseSourceModules(t, map[string]string{
+		"a.rego": pkg(r1, r2),
+	}))
+	next := compileReusing(t, prev, parseSourceModules(t, map[string]string{
+		"a.rego": pkg(r1, r2v2),
+	}))
+	if s := next.RuleReuseStats(); !s.Incremental || s.Reused != 1 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+
+func TestCompilerRuleReuseBreaksOnMovedSourceRule(t *testing.T) {
+	r1 := labeledRule("r1", "1", `input.x == "a"`)
+
+	prev := compileReusing(t, nil, parseSourceModules(t, map[string]string{
+		"a.rego": pkg(r1),
+	}))
+	next := compileReusing(t, prev, parseSourceModules(t, map[string]string{
+		"b.rego": pkg(r1),
+	}))
+
+	if s := next.RuleReuseStats(); s.Incremental || s.Reused != 0 {
+		t.Fatalf("stats %+v", s)
+	}
+}
+
+func TestCompilerRuleReuseDefault(t *testing.T) {
+	const prev = `package test
+
+default allow := false
+allow if input.x == "a"
+`
+	const next = prev + `allow if input.x == "b"
+`
+
+	p := compileReusing(t, nil, parseSourceModules(t, map[string]string{"p.rego": prev}))
+	c := compileReusing(t, p, parseSourceModules(t, map[string]string{"p.rego": next}))
+	if s := c.RuleReuseStats(); !s.Incremental || s.Reused != 2 {
+		t.Fatalf("stats %+v", s)
+	}
+
+	full := NewCompiler()
+	if full.Compile(parseSourceModules(t, map[string]string{"p.rego": next})); full.Failed() {
+		t.Fatal(full.Errors)
+	}
+	if got, exp := c.Modules["p.rego"].String(), full.Modules["p.rego"].String(); got != exp {
+		t.Fatalf("got\n%s\nwant\n%s", got, exp)
+	}
+}
+
+func TestCompilerRuleReuseFunction(t *testing.T) {
+	const prev = `package test
+
+helper(x) if x
+allow if input.x == "a"
+`
+	const next = prev + `allow if input.x == "b"
+`
+
+	p := compileReusing(t, nil, parseSourceModules(t, map[string]string{"p.rego": prev}))
+	c := compileReusing(t, p, parseSourceModules(t, map[string]string{"p.rego": next}))
+	if s := c.RuleReuseStats(); !s.Incremental || s.Reused != 2 {
+		t.Fatalf("stats %+v", s)
+	}
+
+	full := NewCompiler()
+	if full.Compile(parseSourceModules(t, map[string]string{"p.rego": next})); full.Failed() {
+		t.Fatal(full.Errors)
+	}
+	if got, exp := c.Modules["p.rego"].String(), full.Modules["p.rego"].String(); got != exp {
+		t.Fatalf("got\n%s\nwant\n%s", got, exp)
 	}
 }
 

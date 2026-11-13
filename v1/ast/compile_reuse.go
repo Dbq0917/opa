@@ -40,11 +40,11 @@ func ReuseKey(pkg string, texts ...[]byte) RuleKey {
 
 // setReuseKeys keys a parsed module and its rules by their source, so that
 // the keys don't depend on what is kept of it after parsing.
-func setReuseKeys(m *Module) {
+func setReuseKeys(m *Module, keepLocations bool) {
 	m.reuseKey = moduleSourceKey(m)
 	pkg := m.Package.Path.String()
 	for _, r := range m.Rules {
-		r.reuseKey, _ = ruleSourceKeyIn(pkg, r)
+		r.reuseKey, _ = ruleSourceKeyIn(pkg, r, keepLocations)
 	}
 }
 
@@ -91,7 +91,7 @@ func reuseKey(r *Rule) (RuleKey, bool) {
 	return r.reuseKey, r.reuseKey != (RuleKey{})
 }
 
-func ruleSourceKeyIn(pkg string, r *Rule) (RuleKey, bool) {
+func ruleSourceKeyIn(pkg string, r *Rule, keepLocations bool) (RuleKey, bool) {
 	if r.Location == nil || len(r.Location.Text) == 0 {
 		return RuleKey{}, false
 	}
@@ -103,13 +103,23 @@ func ruleSourceKeyIn(pkg string, r *Rule) (RuleKey, bool) {
 		}
 		texts = append(texts, a.Location.Text)
 	}
+	if keepLocations {
+		// A rule moved to another file, or to another position in the same file,
+		// must not reuse compiled code: its locations would be stale.
+		var pos [binary.MaxVarintLen64]byte
+		texts = append(texts, []byte(r.Location.File))
+		texts = append(texts, pos[:binary.PutUvarint(pos[:], uint64(r.Location.Row))])
+		texts = append(texts, pos[:binary.PutUvarint(pos[:], uint64(r.Location.Col))])
+	}
 	return ReuseKey(pkg, append(texts, r.Location.Text)...), true
 }
 
 // WithRuleReuse makes Compile carry over prev's compiled rules whose source is
 // unchanged, compiling only the added ones when that gives the same result as
-// compiling everything. prev must have been compiled with rule reuse too. Only
-// the rules of modules parsed with DropLocations are carried over.
+// compiling everything. prev must have been compiled with rule reuse too.
+// Rules of source modules are only reused if their source location is
+// unchanged as well; generated modules without locations are keyed by source
+// text alone.
 func (c *Compiler) WithRuleReuse(prev *Compiler) *Compiler {
 	c.reuse.enabled = true
 	c.reuse.prev = prev
@@ -193,8 +203,7 @@ func splitReusable(modules map[string]*Module) (map[string][]RuleKey, map[string
 }
 
 func reusableKeys(mod *Module) ([]RuleKey, bool) {
-	// Reused rules keep the locations they were compiled at, which would go stale.
-	if len(mod.Rules) == 0 || mod.Package.Location != nil {
+	if len(mod.Rules) == 0 {
 		return nil, false
 	}
 	for _, a := range mod.Annotations {
@@ -206,8 +215,8 @@ func reusableKeys(mod *Module) ([]RuleKey, bool) {
 	keys := make([]RuleKey, len(mod.Rules))
 	for i, r := range mod.Rules {
 		k, ok := reuseKey(r)
-		// Functions aren't reusable: added rules may call them.
-		if !ok || r.Default || r.Else != nil || len(r.Head.Args) > 0 {
+		// Rules with else bodies aren't reusable: added rules may extend them.
+		if !ok || r.Else != nil {
 			return nil, false
 		}
 		keys[i] = k

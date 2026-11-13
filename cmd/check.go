@@ -5,16 +5,19 @@
 package cmd
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"maps"
 	"os"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"github.com/open-policy-agent/opa/cmd/formats"
 	"github.com/open-policy-agent/opa/cmd/internal/env"
+	"github.com/open-policy-agent/opa/internal/policyconflict"
 	pr "github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/v1/ast"
 	"github.com/open-policy-agent/opa/v1/bundle"
@@ -27,6 +30,8 @@ type checkParams struct {
 	errLimit     int
 	ignore       []string
 	bundleMode   bool
+	base         repeatedStringFlag
+	conflicts    bool
 	capabilities *capabilitiesFlag
 	schema       *schemaFlags
 	strict       bool
@@ -59,17 +64,53 @@ func checkModules(params checkParams, args []string) error {
 		capabilities = ast.CapabilitiesForThisVersion(ast.CapabilitiesRegoVersion(params.regoVersion()))
 	}
 
-	l := loader.NewFileLoader().
-		WithRegoVersion(params.regoVersion()).
-		WithProcessAnnotation(true).
-		WithBundleLazyLoadingMode(bundle.HasExtension()).
-		WithCapabilities(capabilities)
-
 	ss, err := loader.Schemas(params.schema.path)
 	if err != nil {
 		return err
 	}
 
+	modules, data, err := loadCheckInput(params, capabilities, args)
+	if err != nil {
+		return err
+	}
+
+	var baseModules map[string]*ast.Module
+	var baseCompiler *ast.Compiler
+	if len(params.base.v) > 0 {
+		var baseData map[string]any
+		baseModules, baseData, err = loadCheckInput(params, capabilities, params.base.v)
+		if err != nil {
+			return err
+		}
+		baseCompiler, err = compileCheckModules(params, capabilities, ss, baseModules, baseData, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	compiler, err := compileCheckModules(params, capabilities, ss, modules, data, baseCompiler)
+	if err != nil {
+		return err
+	}
+	if !params.conflicts && len(params.base.v) == 0 {
+		return nil
+	}
+
+	conflicts, err := policyconflict.Check(context.Background(), modules, compiler, baseModules, baseCompiler)
+	if err != nil {
+		return err
+	}
+	if len(conflicts) == 0 {
+		return nil
+	}
+	errs := make(ast.Errors, 0, len(conflicts))
+	for _, c := range conflicts {
+		errs = append(errs, c.FormatError())
+	}
+	return errs
+}
+
+func compileCheckModules(params checkParams, capabilities *ast.Capabilities, ss *ast.SchemaSet, modules map[string]*ast.Module, data map[string]any, reuse *ast.Compiler) (*ast.Compiler, error) {
 	compiler := ast.NewCompiler().
 		SetErrorLimit(params.errLimit).
 		WithCapabilities(capabilities).
@@ -77,41 +118,103 @@ func checkModules(params checkParams, args []string) error {
 		WithEnablePrintStatements(true).
 		WithStrict(params.strict).
 		WithUseTypeCheckAnnotations(true)
+	if reuse != nil || len(params.base.v) > 0 {
+		compiler.WithRuleReuse(reuse)
+	}
+	if len(data) > 0 {
+		compiler = compiler.WithPathConflictsCheck(mapFinder(data))
+	}
+	compiler.Compile(modules)
+	if compiler.Failed() {
+		return compiler, compiler.Errors
+	}
+	return compiler, nil
+}
 
-	var modules map[string]*ast.Module
+func loadCheckInput(params checkParams, capabilities *ast.Capabilities, args []string) (map[string]*ast.Module, map[string]any, error) {
+	l := loader.NewFileLoader().
+		WithRegoVersion(params.regoVersion()).
+		WithProcessAnnotation(true).
+		WithBundleLazyLoadingMode(bundle.HasExtension()).
+		WithCapabilities(capabilities)
 
 	if params.bundleMode {
 		bundles := make([]*bundle.Bundle, 0, len(args))
 		for _, path := range args {
 			b, err := l.WithSkipBundleVerification(true).WithFilter(filterFromPaths(params.ignore)).AsBundle(path)
 			if err != nil {
-				return err
+				return nil, nil, err
 			}
 			bundles = append(bundles, b)
 		}
 		b, err := bundle.Merge(bundles)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
+		return maps.Clone(b.ParsedModules("")), b.Data, nil
+	}
 
-		modules = maps.Clone(b.ParsedModules(""))
-		if len(b.Data) > 0 {
-			compiler = compiler.WithPathConflictsCheck(mapFinder(b.Data))
-		}
-	} else {
-		result, err := l.Filtered(args, ignoredOnlyRego(params.ignore).Apply)
+	result, err := l.Filtered(args, ignoredOnlyRego(params.ignore).Apply)
+	if err != nil {
+		return nil, nil, err
+	}
+	modules, err := parseLogicalModules(params, capabilities, args, result)
+	if err != nil {
+		return nil, nil, err
+	}
+	return modules, result.Documents, nil
+}
+
+func parseLogicalModules(params checkParams, capabilities *ast.Capabilities, args []string, result *loader.Result) (map[string]*ast.Module, error) {
+	roots := make([]string, 0, len(args))
+	for _, arg := range args {
+		_, p := loader.SplitPrefix(arg)
+		p = filepath.Clean(p)
+		info, err := os.Stat(p)
 		if err != nil {
-			return err
+			return nil, err
 		}
-
-		modules = result.ParsedModules()
+		if info.IsDir() {
+			roots = append(roots, p)
+		} else {
+			roots = append(roots, filepath.Dir(p))
+		}
 	}
 
-	if compiler.Compile(modules); compiler.Failed() {
-		return compiler.Errors
+	modules := make(map[string]*ast.Module, len(result.Modules))
+	for _, rf := range result.Modules {
+		name := logicalModuleName(rf.Name, roots)
+		if len(rf.Raw) == 0 {
+			modules[name] = rf.Parsed
+			continue
+		}
+		m, err := ast.ParseModuleWithOpts(name, string(rf.Raw), ast.ParserOptions{
+			RegoVersion:       params.regoVersion(),
+			ProcessAnnotation: true,
+			Capabilities:      capabilities,
+		})
+		if err != nil {
+			return nil, err
+		}
+		modules[name] = m
 	}
+	return modules, nil
+}
 
-	return nil
+func logicalModuleName(name string, roots []string) string {
+	best := ""
+	for _, root := range roots {
+		if rel, err := filepath.Rel(root, name); err == nil && !filepath.IsAbs(rel) &&
+			(rel == "." || len(rel) == 0 || rel[0] != '.') && len(root) > len(best) {
+			best = root
+		}
+	}
+	if best != "" {
+		if rel, err := filepath.Rel(best, name); err == nil && rel != "." && !filepath.IsAbs(rel) {
+			return filepath.ToSlash(rel)
+		}
+	}
+	return filepath.ToSlash(name)
 }
 
 // emulate storage.NonEmpty without having to create storage / transaction
@@ -177,7 +280,11 @@ func initCheck(root *cobra.Command, _ string) {
 	
 If the 'check' command succeeds in parsing and compiling the source file(s), no output
 is produced. If the parsing or compiling fails, 'check' will output the errors
-and exit with a non-zero exit code.`,
+and exit with a non-zero exit code.
+
+Use --base to compare the policy against a baseline. The current policy reuses the
+compiled rules of the baseline that did not change, and newly introduced overlaps
+between allow and deny decisions are reported as errors.`,
 
 		PreRunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -202,6 +309,10 @@ and exit with a non-zero exit code.`,
 	addIgnoreFlag(checkCommand.Flags(), &checkParams.ignore)
 	addOutputFormat(checkCommand.Flags(), checkParams.format)
 	addBundleModeFlag(checkCommand.Flags(), &checkParams.bundleMode)
+	checkCommand.Flags().Var(&checkParams.base, "base",
+		"baseline policy path(s); reuses unchanged rules and reports new allow/deny conflicts")
+	checkCommand.Flags().BoolVar(&checkParams.conflicts, "conflicts", false,
+		"report allow/deny conflicts; with --base, only report conflicts not present in the baseline")
 	addCapabilitiesFlag(checkCommand.Flags(), checkParams.capabilities)
 	addSchemaFlags(checkCommand.Flags(), checkParams.schema)
 	addStrictFlag(checkCommand.Flags(), &checkParams.strict, false)

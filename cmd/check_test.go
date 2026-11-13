@@ -274,6 +274,115 @@ func TestCheckIgnoresNonRegoFiles(t *testing.T) {
 	})
 }
 
+func TestCheckBaseReportsNewDecisionConflict(t *testing.T) {
+	baseFiles := map[string]string{
+		"policies/p.rego": `package test
+
+allow if input.user == "admin"
+`,
+	}
+	headFiles := map[string]string{
+		"policies/p.rego": `package test
+
+allow if input.user == "admin"
+
+deny if input.user == "admin"
+`,
+	}
+
+	test.WithTempFS(baseFiles, func(base string) {
+		test.WithTempFS(headFiles, func(head string) {
+			params := newCheckParams()
+			if err := params.base.Set(base); err != nil {
+				t.Fatal(err)
+			}
+			err := checkModules(params, []string{head})
+			if err == nil {
+				t.Fatal("expected a conflict")
+			}
+			if !strings.Contains(err.Error(), "conflicting decisions") {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	})
+}
+
+func TestCheckBaseCompilesIncrementally(t *testing.T) {
+	baseFiles := map[string]string{
+		"policies/p.rego": `package test
+
+allow if input.user == "admin"
+`,
+	}
+	headFiles := map[string]string{
+		"policies/p.rego": `package test
+
+allow if input.user == "admin"
+allow if input.user == "root"
+`,
+	}
+
+	test.WithTempFS(baseFiles, func(base string) {
+		test.WithTempFS(headFiles, func(head string) {
+			params := newCheckParams()
+			if err := params.base.Set(base); err != nil {
+				t.Fatal(err)
+			}
+			caps := ast.CapabilitiesForThisVersion(ast.CapabilitiesRegoVersion(params.regoVersion()))
+			baseModules, baseData, err := loadCheckInput(params, caps, []string{base})
+			if err != nil {
+				t.Fatal(err)
+			}
+			baseCompiler, err := compileCheckModules(params, caps, nil, baseModules, baseData, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			modules, data, err := loadCheckInput(params, caps, []string{head})
+			if err != nil {
+				t.Fatal(err)
+			}
+			compiler, err := compileCheckModules(params, caps, nil, modules, data, baseCompiler)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats := compiler.RuleReuseStats(); !stats.Incremental || stats.Reused == 0 {
+				t.Fatalf("expected an incremental compile, got %+v", stats)
+			}
+		})
+	})
+}
+
+func TestCheckBaseIgnoresExistingDecisionConflict(t *testing.T) {
+	files := map[string]string{
+		"p.rego": `package test
+
+allow if input.user == "admin"
+deny if input.user == "admin"
+`,
+	}
+	headFiles := map[string]string{
+		"p.rego": `package test
+
+allow if input.user == "admin"
+deny if input.user == "admin"
+
+deny if input.user == "bob"
+`,
+	}
+
+	test.WithTempFS(files, func(base string) {
+		test.WithTempFS(headFiles, func(head string) {
+			params := newCheckParams()
+			if err := params.base.Set(base); err != nil {
+				t.Fatal(err)
+			}
+			if err := checkModules(params, []string{head}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	})
+}
+
 func TestCheckIgnoreBundleMode(t *testing.T) {
 	t.Parallel()
 
